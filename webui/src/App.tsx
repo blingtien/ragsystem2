@@ -8,6 +8,7 @@ import QueryInterface from './pages/QueryInterface'
 import SystemStatus from './pages/SystemStatus'
 import Configuration from './pages/Configuration'
 import GraphVisualization from './pages/GraphVisualization'
+import MultimodalQuery from './components/MultimodalQuery'
 
 const { Content } = Layout
 
@@ -23,6 +24,7 @@ const App: React.FC = () => {
               <Route path="/overview" element={<Overview />} />
               <Route path="/documents" element={<DocumentManager />} />
               <Route path="/query" element={<QueryInterface />} />
+              <Route path="/multimodal" element={<MultimodalQuery />} />
               <Route path="/graph" element={<GraphVisualization />} />
               <Route path="/status" element={<SystemStatus />} />
               <Route path="/config" element={<Configuration />} />

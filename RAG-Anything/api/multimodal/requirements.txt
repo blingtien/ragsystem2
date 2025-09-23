@@ -1,0 +1,26 @@
+# Multimodal Processing Dependencies
+
+# Image Processing
+Pillow>=10.0.0
+pytesseract>=0.3.10  # OCR functionality
+python-magic>=0.4.27  # File type detection
+
+# Vision Models (optional)
+transformers>=4.30.0  # For BLIP vision model
+torch>=2.0.0  # Required for transformers
+
+# Data Processing
+pandas>=2.0.0
+numpy>=1.24.0
+
+# Caching
+redis>=5.0.0  # Redis client with async support
+psycopg2-binary>=2.9.0  # PostgreSQL client
+
+# API Dependencies
+fastapi>=0.100.0
+pydantic>=2.0.0
+slowapi>=0.1.8  # Rate limiting
+
+# Math/LaTeX (optional)
+sympy>=1.12  # For equation processing

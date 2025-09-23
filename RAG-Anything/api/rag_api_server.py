@@ -70,7 +70,7 @@ except ImportError:
     TORCH_AVAILABLE = False
 
 import uvicorn
-from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException
+from fastapi import FastAPI, File, UploadFile, WebSocket, WebSocketDisconnect, HTTPException, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel
@@ -106,6 +106,16 @@ from connection_status_checker import RemoteConnectionChecker
 
 # 导入状态管理器
 from core.state_manager import StateManager, Document
+
+# 导入多模态处理组件
+try:
+    from multimodal.api_endpoint import MultimodalAPIHandler, MultimodalQueryRequest, MultimodalQueryResponse
+    from multimodal.cache_manager import CacheManager
+    from multimodal.validators import ValidationError
+    MULTIMODAL_AVAILABLE = True
+except ImportError as e:
+    logger.warning(f"多模态组件未安装或导入失败: {e}")
+    MULTIMODAL_AVAILABLE = False
 
 # 注释掉其他.env加载，统一使用上面的绝对路径
 # load_dotenv(dotenv_path="/home/ragsvr/projects/ragsystem/RAG-Anything/.env", override=False)  # 优先加载RAG-Anything的.env
@@ -155,6 +165,14 @@ async def lifespan(app):
     await initialize_rag()
     logger.info("✅ RAG系统初始化完成")
 
+    # Step 4.5: 初始化多模态处理器
+    if MULTIMODAL_AVAILABLE:
+        logger.info("🎨 初始化多模态处理器...")
+        await initialize_multimodal_handler()
+        logger.info("✅ 多模态处理器初始化完成")
+    else:
+        logger.info("⚠️ 多模态处理器不可用")
+
     # Step 5: 加载已存在的文档
     logger.info("📚 加载已存在的文档...")
     await load_existing_documents()
@@ -201,6 +219,7 @@ app.add_middleware(
 rag_instance: Optional[RAGAnything] = None
 cache_enhanced_processor: Optional[CacheEnhancedProcessor] = None
 state_manager: Optional[StateManager] = None  # 状态管理器
+multimodal_handler: Optional[MultimodalAPIHandler] = None  # 多模态处理器
 tasks: Dict[str, dict] = {}
 documents: Dict[str, dict] = {}  # 将逐步废弃，替换为state_manager
 active_websockets: Dict[str, WebSocket] = {}
@@ -438,6 +457,56 @@ async def safe_find_documents_by_filename(filename: str) -> List[Document]:
     except Exception as e:
         logger.warning(f"按文件名查找文档失败: {str(e)}")
         return []
+
+async def initialize_multimodal_handler():
+    """初始化多模态处理器"""
+    global multimodal_handler
+
+    logger.info("🔧 initialize_multimodal_handler() 被调用")
+
+    if multimodal_handler is not None:
+        logger.info("✅ 多模态处理器已存在，直接返回")
+        return multimodal_handler
+
+    logger.info("🚀 开始初始化新的多模态处理器")
+
+    try:
+        # 初始化多模态缓存管理器
+        redis_url = os.getenv("REDIS_URL", "redis://localhost:6379")
+        postgres_config = {
+            "host": os.getenv("POSTGRES_HOST", "localhost"),
+            "port": int(os.getenv("POSTGRES_PORT", 5432)),
+            "database": os.getenv("POSTGRES_DB", "raganything"),
+            "user": os.getenv("POSTGRES_USER", "raganything_user"),
+            "password": os.getenv("POSTGRES_PASSWORD")
+        }
+
+        multimodal_cache_manager = CacheManager(
+            redis_url=redis_url,
+            postgres_config=postgres_config,
+            enable_memory_cache=True,
+            memory_cache_size=100
+        )
+
+        await multimodal_cache_manager.initialize()
+        logger.info("✅ 多模态缓存管理器初始化成功")
+
+        # 初始化多模态API处理器
+        multimodal_handler = MultimodalAPIHandler(
+            rag_instance=rag_instance,
+            cache_manager=multimodal_cache_manager
+        )
+
+        await multimodal_handler.initialize()
+        logger.info("✅ 多模态处理器初始化成功")
+
+        return multimodal_handler
+
+    except Exception as e:
+        logger.error(f"多模态处理器初始化失败: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+        return None
 
 async def initialize_rag():
     """初始化RAG系统和缓存增强处理器"""
@@ -2392,6 +2461,121 @@ async def query_documents(request: QueryRequest):
         else:
             raise HTTPException(status_code=500, detail=f"查询失败: {str(e)}")
 
+@app.post("/api/v1/query/multimodal")
+async def query_multimodal(request: MultimodalQueryRequest, background_tasks: BackgroundTasks):
+    """多模态查询端点 - 支持图像、表格、公式等多种内容类型"""
+
+    # 添加详细日志
+    print(f"[RAG_API_SERVER] Received multimodal query")
+    print(f"[RAG_API_SERVER] Query: {request.query}")
+    print(f"[RAG_API_SERVER] Mode: {request.mode}")
+    print(f"[RAG_API_SERVER] Multimodal content count: {len(request.multimodal_content) if request.multimodal_content else 0}")
+    logger.info(f"[RAG_API_SERVER] Multimodal query received: {request.query[:100]}")
+
+    # 检查多模态处理器是否可用
+    if not MULTIMODAL_AVAILABLE or not multimodal_handler:
+        print(f"[RAG_API_SERVER] Multimodal handler not available")
+        raise HTTPException(
+            status_code=503,
+            detail="多模态处理器未安装或未初始化。请检查依赖项和配置。"
+        )
+
+    # 确保RAG系统已初始化
+    if not rag_instance:
+        print(f"[RAG_API_SERVER] RAG instance not initialized")
+        raise HTTPException(
+            status_code=503,
+            detail="RAG系统未初始化"
+        )
+
+    try:
+        print(f"[RAG_API_SERVER] Calling multimodal_handler.process_multimodal_query")
+        # 处理多模态查询
+        result = await multimodal_handler.process_multimodal_query(
+            request,
+            background_tasks
+        )
+
+        # 记录查询成功
+        print(f"[RAG_API_SERVER] Query processed successfully: {result.query_id}")
+        logger.info(f"多模态查询成功: query_id={result.query_id}")
+
+        return result
+
+    except ValidationError as e:
+        print(f"[RAG_API_SERVER] ValidationError caught: {e}")
+        logger.error(f"[RAG_API_SERVER] ValidationError: {e}")
+        # 验证错误 - 输入格式不正确
+        logger.warning(f"多模态查询验证失败: {e.message}")
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": "validation_error",
+                "message": e.message,
+                "details": e.details
+            }
+        )
+
+    except Exception as e:
+        # 其他错误
+        logger.error(f"多模态查询失败: {str(e)}")
+        import traceback
+        logger.error(traceback.format_exc())
+
+        raise HTTPException(
+            status_code=500,
+            detail={
+                "error": "processing_error",
+                "message": "多模态查询处理失败",
+                "details": str(e)
+            }
+        )
+
+@app.get("/api/v1/multimodal/health")
+async def multimodal_health():
+    """检查多模态处理器健康状态"""
+    if not MULTIMODAL_AVAILABLE:
+        return {
+            "status": "unavailable",
+            "message": "多模态组件未安装"
+        }
+
+    if not multimodal_handler:
+        return {
+            "status": "uninitialized",
+            "message": "多模态处理器未初始化"
+        }
+
+    try:
+        health = await multimodal_handler.health_check()
+        return health
+    except Exception as e:
+        return {
+            "status": "unhealthy",
+            "message": str(e)
+        }
+
+@app.get("/api/v1/multimodal/metrics")
+async def multimodal_metrics():
+    """获取多模态处理器指标"""
+    if not multimodal_handler:
+        raise HTTPException(
+            status_code=503,
+            detail="多模态处理器未初始化"
+        )
+
+    try:
+        metrics = multimodal_handler.get_metrics()
+        return {
+            "success": True,
+            "metrics": metrics
+        }
+    except Exception as e:
+        raise HTTPException(
+            status_code=500,
+            detail=f"获取指标失败: {str(e)}"
+        )
+
 @app.get("/api/v1/tasks")
 async def list_tasks():
     """获取任务列表"""
@@ -2712,19 +2896,34 @@ async def delete_documents(request: DocumentDeleteRequest):
     rag = await initialize_rag()
     
     for doc_id in request.document_ids:
-        if doc_id in documents:
+        # 从数据库获取文档信息
+        doc = await state_manager.get_document(doc_id) if state_manager else None
+
+        # 如果数据库中没有，尝试从内存中获取（兼容旧代码）
+        if not doc and doc_id in documents:
             doc = documents[doc_id]
+
+        if doc:
+            # 处理Document对象和dict兼容性
+            if hasattr(doc, 'file_name'):  # Document对象
+                file_name = doc.file_name
+                file_path = doc.file_path
+                rag_doc_id = doc.rag_doc_id
+            else:  # dict
+                file_name = doc.get("file_name", "unknown")
+                file_path = doc.get("file_path", "")
+                rag_doc_id = doc.get("rag_doc_id")
+
             result = {
                 "document_id": doc_id,
-                "file_name": doc.get("file_name", "unknown"),
+                "file_name": file_name,
                 "status": "success",
                 "message": "",
                 "details": {}
             }
-            
+
             try:
                 # 1. 从RAG系统中删除文档数据（如果有rag_doc_id）
-                rag_doc_id = doc.get("rag_doc_id")
                 if rag_doc_id and rag:
                     logger.info(f"从RAG系统删除文档: {rag_doc_id}")
                     deletion_result = await rag.lightrag.adelete_by_doc_id(rag_doc_id)
@@ -2742,25 +2941,30 @@ async def delete_documents(request: DocumentDeleteRequest):
                     }
                 
                 # 2. 删除上传的文件
-                if os.path.exists(doc["file_path"]):
-                    os.remove(doc["file_path"])
+                if file_path and os.path.exists(file_path):
+                    os.remove(file_path)
                     result["details"]["file_deletion"] = "文件已删除"
-                    logger.info(f"删除文件: {doc['file_path']}")
+                    logger.info(f"删除文件: {file_path}")
                 else:
                     result["details"]["file_deletion"] = "文件不存在或已删除"
                 
-                # 3. 从内存中删除文档记录
-                del documents[doc_id]
+                # 3. 从数据库中删除文档记录
+                if state_manager:
+                    await state_manager.remove_document(doc_id)
+
+                # 4. 从内存中删除文档记录（如果存在）
+                if doc_id in documents:
+                    del documents[doc_id]
                 deleted_count += 1
                 
-                result["message"] = f"文档 {doc['file_name']} 已完全删除"
-                logger.info(f"成功删除文档: {doc['file_name']}")
+                result["message"] = f"文档 {file_name} 已完全删除"
+                logger.info(f"成功删除文档: {file_name}")
                 
             except Exception as e:
                 result["status"] = "error"
                 result["message"] = f"删除文档时发生错误: {str(e)}"
                 result["details"]["error"] = str(e)
-                logger.error(f"删除文档失败 {doc['file_name']}: {str(e)}")
+                logger.error(f"删除文档失败 {file_name}: {str(e)}")
             
             deletion_results.append(result)
         else:

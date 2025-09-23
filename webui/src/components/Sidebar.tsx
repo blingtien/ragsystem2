@@ -9,7 +9,8 @@ const {
   MessageOutlined,
   ApartmentOutlined,
   BarChartOutlined,
-  SettingOutlined
+  SettingOutlined,
+  PictureOutlined
 } = Icons
 
 const { Sider } = Layout
@@ -34,6 +35,11 @@ const Sidebar: React.FC = () => {
       key: '/query',
       icon: <MessageOutlined />,
       label: '智能查询',
+    },
+    {
+      key: '/multimodal',
+      icon: <PictureOutlined />,
+      label: '多模态查询',
     },
     {
       key: '/graph',

@@ -1,7 +1,7 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react'
 import { Card, Typography, Upload, Row, Col, Tag, Table, Button, Progress, Space, message, Modal, Divider, Tooltip, Layout, Checkbox, Alert, Dropdown } from 'antd'
 import * as Icons from '@ant-design/icons'
-const { InboxOutlined, PlayCircleOutlined, DeleteOutlined, ReloadOutlined, ExclamationCircleOutlined, PauseCircleOutlined, ClearOutlined, FolderOpenOutlined, CheckSquareOutlined, MinusSquareOutlined, DownOutlined, PlaySquareOutlined } = Icons
+const { InboxOutlined, PlayCircleOutlined, DeleteOutlined, ReloadOutlined, ExclamationCircleOutlined, PauseCircleOutlined, ClearOutlined, FolderOpenOutlined, CheckSquareOutlined, MinusSquareOutlined, DownOutlined, PlaySquareOutlined, RocketOutlined } = Icons
 import axios, { AxiosError } from 'axios'
 import { batchProcessDocuments } from '../utils/batchProcessor'
 import { PERFORMANCE_CONFIG, PerformanceMonitor } from '../config/performance.config'
@@ -91,6 +91,8 @@ const DocumentManager: React.FC = () => {
   const [processingLogs, setProcessingLogs] = useState<string[]>([])
   const [selectedDocuments, setSelectedDocuments] = useState<string[]>([])
   const [dragOver, setDragOver] = useState(false)
+  const [autoParsingInProgress, setAutoParsingInProgress] = useState(false)
+  const [autoParseProgress, setAutoParseProgress] = useState({ current: 0, total: 0 })
   // 分页状态管理
   const [currentPage, setCurrentPage] = useState(1)
   const [pageSize, setPageSize] = useState(10)
@@ -294,6 +296,108 @@ const DocumentManager: React.FC = () => {
     })
   }
   
+  // Auto Parse functionality - processes all unparsed documents in batches
+  const handleAutoParse = async () => {
+    // Get all unparsed documents
+    const unparsedDocuments = documents.filter(doc =>
+      (doc.status_code === 'pending' || doc.status_code === 'uploaded' || doc.status_code === 'failed')
+      && doc.can_process
+    )
+
+    if (unparsedDocuments.length === 0) {
+      message.info('没有需要解析的文档')
+      return
+    }
+
+    Modal.confirm({
+      title: '自动解析确认',
+      icon: <RocketOutlined />,
+      content: (
+        <div>
+          <p>检测到 {unparsedDocuments.length} 个未解析的文档</p>
+          <p style={{ fontSize: '12px', color: '#666', marginTop: 8 }}>
+            系统将自动分批处理，每批 3 个文档并行解析，直至全部完成
+          </p>
+        </div>
+      ),
+      okText: '开始自动解析',
+      cancelText: '取消',
+      onOk: async () => {
+        setAutoParsingInProgress(true)
+        setAutoParseProgress({ current: 0, total: unparsedDocuments.length })
+
+        const BATCH_SIZE = 3 // Process 3 documents at a time
+        const totalBatches = Math.ceil(unparsedDocuments.length / BATCH_SIZE)
+        let processedCount = 0
+        let failedCount = 0
+
+        message.info(`开始自动解析 ${unparsedDocuments.length} 个文档，分 ${totalBatches} 批处理`)
+
+        try {
+          // Process in batches
+          for (let i = 0; i < unparsedDocuments.length; i += BATCH_SIZE) {
+            const batch = unparsedDocuments.slice(i, i + BATCH_SIZE)
+            const batchNumber = Math.floor(i / BATCH_SIZE) + 1
+
+            // Update progress
+            setAutoParseProgress({
+              current: processedCount,
+              total: unparsedDocuments.length
+            })
+
+            message.loading({
+              content: `正在处理第 ${batchNumber}/${totalBatches} 批 (${batch.length} 个文档)...`,
+              key: 'auto-parse-batch',
+              duration: 0
+            })
+
+            // Process batch using the existing batch processing function
+            const documentIds = batch.map(doc => doc.document_id)
+            const { successCount, failCount } = await batchProcessDocuments(
+              documentIds,
+              undefined, // No custom progress callback needed
+              undefined, // Use default parser
+              undefined  // Use default method
+            )
+
+            processedCount += successCount
+            failedCount += failCount
+
+            // Update progress after batch completion
+            setAutoParseProgress({
+              current: processedCount + failedCount,
+              total: unparsedDocuments.length
+            })
+
+            // Small delay between batches to avoid overwhelming the system
+            if (i + BATCH_SIZE < unparsedDocuments.length) {
+              await new Promise(resolve => setTimeout(resolve, 1000))
+            }
+          }
+
+          message.destroy('auto-parse-batch')
+
+          // Show final results
+          if (processedCount > 0) {
+            message.success(`自动解析完成：成功 ${processedCount} 个${failedCount > 0 ? `，失败 ${failedCount} 个` : ''}`)
+          } else {
+            message.error(`自动解析失败：所有 ${failedCount} 个文档都处理失败`)
+          }
+
+          await refreshData()
+
+        } catch (error) {
+          message.destroy('auto-parse-batch')
+          message.error('自动解析过程中发生错误')
+          console.error('Auto parse error:', error)
+        } finally {
+          setAutoParsingInProgress(false)
+          setAutoParseProgress({ current: 0, total: 0 })
+        }
+      }
+    })
+  }
+
   // Batch delete with enhanced error handling
   const batchDeleteDocuments = async (documentIds: string[]) => {
     if (documentIds.length === 0) {
@@ -449,15 +553,6 @@ const DocumentManager: React.FC = () => {
                 </div>
               </div>
             )}
-          </div>
-        )
-      case 'queued':
-        return (
-          <div>
-            <Tag color="orange">排队等待</Tag>
-            <div style={{ fontSize: 12, color: '#ff7a00', marginTop: 4 }}>
-              正在等待处理资源释放
-            </div>
           </div>
         )
       case 'pending':
@@ -1168,7 +1263,7 @@ const DocumentManager: React.FC = () => {
                 </Button>
               </div>
             }
-            style={{ height: '400px' }}
+            style={{ height: '480px' }}
             bodyStyle={{ height: 'calc(100% - 56px)', display: 'flex', flexDirection: 'column' }}
           >
             {/* Pending files list */}
@@ -1183,7 +1278,7 @@ const DocumentManager: React.FC = () => {
                   <span style={{ fontWeight: 'bold' }}>
                     待上传文件 ({pendingFiles.length})
                     {pendingFiles.length > MAX_CONCURRENT_UPLOADS && (
-                      <Tag size="small" color="orange" style={{ marginLeft: 8 }}>
+                      <Tag color="orange" style={{ marginLeft: 8, fontSize: '12px' }}>
                         将分批上传
                       </Tag>
                     )}
@@ -1234,7 +1329,7 @@ const DocumentManager: React.FC = () => {
                           }}>
                             {pendingFile.relativePath || pendingFile.file.name}
                           </span>
-                          <Tag size="small" color="blue">{formatFileSize(pendingFile.file.size)}</Tag>
+                          <Tag color="blue" style={{ fontSize: '12px' }}>{formatFileSize(pendingFile.file.size)}</Tag>
                         </div>
                         {pendingFile.status === 'uploading' && (
                           <Progress 
@@ -1245,11 +1340,11 @@ const DocumentManager: React.FC = () => {
                           />
                         )}
                         {pendingFile.status === 'uploaded' && (
-                          <Tag color="success" size="small">上传成功</Tag>
+                          <Tag color="success" style={{ fontSize: '12px' }}>上传成功</Tag>
                         )}
                         {pendingFile.status === 'error' && (
                           <Tooltip title={pendingFile.error}>
-                            <Tag color="error" size="small">上传失败</Tag>
+                            <Tag color="error" style={{ fontSize: '12px' }}>上传失败</Tag>
                           </Tooltip>
                         )}
                       </div>
@@ -1308,6 +1403,44 @@ const DocumentManager: React.FC = () => {
                 </div>
               </Dragger>
             </div>
+
+            {/* Auto Parse button area */}
+            <div style={{
+              marginTop: 12,
+              padding: '12px',
+              backgroundColor: '#f5f5f5',
+              borderRadius: '6px',
+              display: 'flex',
+              justifyContent: 'space-between',
+              alignItems: 'center'
+            }}>
+              <div style={{ flex: 1 }}>
+                <Button
+                  type="primary"
+                  icon={<RocketOutlined />}
+                  onClick={handleAutoParse}
+                  loading={autoParsingInProgress}
+                  disabled={uploading || documents.length === 0}
+                  style={{ width: '100%' }}
+                  size="large"
+                >
+                  {autoParsingInProgress
+                    ? `自动解析中 (${autoParseProgress.current}/${autoParseProgress.total})`
+                    : '自动解析所有未处理文档'}
+                </Button>
+                {autoParsingInProgress && autoParseProgress.total > 0 && (
+                  <Progress
+                    percent={Math.round((autoParseProgress.current / autoParseProgress.total) * 100)}
+                    size="small"
+                    status="active"
+                    style={{ marginTop: 8 }}
+                  />
+                )}
+                <div style={{ fontSize: '12px', color: '#666', marginTop: 4, textAlign: 'center' }}>
+                  自动检测并批量解析所有未处理的文档（每批3个并行处理）
+                </div>
+              </div>
+            </div>
           </Card>
         </Col>
 
@@ -1332,7 +1465,7 @@ const DocumentManager: React.FC = () => {
                 </Space>
               </div>
             }
-            style={{ height: '400px' }}
+            style={{ height: '480px' }}
             bodyStyle={{ 
               height: 'calc(100% - 56px)', 
               padding: 0,
@@ -1464,7 +1597,7 @@ const DocumentManager: React.FC = () => {
                 setCurrentPage(1) // 分页大小变化时重置到第一页
               }
             },
-            onShowSizeChange: (current, size) => {
+            onShowSizeChange: (_current, size) => {
               setPageSize(size)
               setCurrentPage(1) // 重置到第一页
             },
@@ -1495,7 +1628,7 @@ const DocumentManager: React.FC = () => {
               >
                 <div style={{ fontSize: 20, marginBottom: 6 }}>{format.emoji}</div>
                 <div style={{ fontWeight: 'bold', marginBottom: 4 }}>
-                  <Tag size="small" color="blue">{format.format}</Tag>
+                  <Tag color="blue" style={{ fontSize: '12px' }}>{format.format}</Tag>
                 </div>
                 <div style={{ fontSize: 11, color: '#666' }}>{format.description}</div>
               </div>
