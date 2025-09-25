@@ -131,7 +131,7 @@ class ProcessorMixin:
             return None
 
         try:
-            cached_data = await self.parse_cache.get_by_id(cache_key)
+            cached_data = await self.parse_cache.get_by_id_parse_cache(cache_key)
             if not cached_data:
                 return None
 

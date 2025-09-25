@@ -103,6 +103,8 @@ from enhanced_error_handler import enhanced_error_handler
 from advanced_progress_tracker import advanced_progress_tracker
 # 导入连接状态检测器
 from connection_status_checker import RemoteConnectionChecker
+# 导入并行批量处理器
+from parallel_batch_processor import ParallelBatchProcessor
 
 # 导入状态管理器
 from core.state_manager import StateManager, Document
@@ -174,8 +176,10 @@ async def lifespan(app):
         logger.info("⚠️ 多模态处理器不可用")
 
     # Step 5: 加载已存在的文档
+    print(f"[STARTUP] Step 5: 开始加载已存在的文档...", flush=True)
     logger.info("📚 加载已存在的文档...")
     await load_existing_documents()
+    print(f"[STARTUP] 文档加载完成，documents字典中有 {len(documents)} 个文档", flush=True)
     logger.info(f"✅ 文档加载完成，当前有 {len(documents)} 个文档")
     
     # Step 5: 启动完成汇总
@@ -218,6 +222,7 @@ app.add_middleware(
 # 全局变量
 rag_instance: Optional[RAGAnything] = None
 cache_enhanced_processor: Optional[CacheEnhancedProcessor] = None
+parallel_batch_processor: Optional[ParallelBatchProcessor] = None  # 并行批量处理器
 state_manager: Optional[StateManager] = None  # 状态管理器
 multimodal_handler: Optional[MultimodalAPIHandler] = None  # 多模态处理器
 tasks: Dict[str, dict] = {}
@@ -324,14 +329,19 @@ async def load_existing_documents():
     """从数据库加载已存在的文档状态"""
     global documents, tasks, batch_operations
 
+    print(f"[STARTUP] load_existing_documents() 被调用", flush=True)
+    print(f"[STARTUP] state_manager存在: {state_manager is not None}", flush=True)
+
     try:
         # 使用StateManager从数据库加载所有文档（包括已完成和失败的）
         if state_manager:
+            print(f"[STARTUP] 开始从数据库加载文档...", flush=True)
             all_docs = await state_manager.get_all_documents()
+            print(f"[STARTUP] 从数据库获取到 {len(all_docs)} 个文档", flush=True)
             logger.info(f"从数据库发现 {len(all_docs)} 个文档记录")
 
             # 转换为内存字典格式（保持兼容性）
-            for doc in all_docs:
+            for i, doc in enumerate(all_docs):
                 # 将Document对象转换为字典格式
                 document_dict = {
                     "document_id": doc.document_id,
@@ -356,6 +366,10 @@ async def load_existing_documents():
 
                 documents[doc.document_id] = document_dict
 
+                # 打印前3个文档的详细信息
+                if i < 3:
+                    print(f"[STARTUP] 文档 {i+1}: ID={doc.document_id}, 文件名={doc.file_name}, 状态={doc.status}", flush=True)
+
                 # 为已完成的文档创建对应的任务记录（如果需要）
                 if doc.task_id and doc.status in ["completed", "failed"]:
                     task = {
@@ -371,8 +385,11 @@ async def load_existing_documents():
                     }
                     tasks[doc.task_id] = task
 
+            print(f"[STARTUP] ✅ 成功加载 {len(documents)} 个文档到内存字典", flush=True)
+            print(f"[STARTUP] 内存documents字典keys: {list(documents.keys())[:5]}...", flush=True)
             logger.info(f"成功从数据库加载 {len(documents)} 个文档状态")
         else:
+            print(f"[STARTUP] ⚠️ StateManager未初始化，无法加载文档", flush=True)
             logger.warning("StateManager未初始化，无法加载文档")
 
     except Exception as e:
@@ -510,10 +527,10 @@ async def initialize_multimodal_handler():
 
 async def initialize_rag():
     """初始化RAG系统和缓存增强处理器"""
-    global rag_instance, cache_enhanced_processor
-    
+    global rag_instance, cache_enhanced_processor, parallel_batch_processor
+
     logger.info("🔧 initialize_rag() 被调用")
-    
+
     if rag_instance is not None:
         logger.info("✅ RAG实例已存在，直接返回")
         return rag_instance
@@ -639,7 +656,14 @@ async def initialize_rag():
             rag_instance=rag_instance,
             storage_dir=WORKING_DIR
         )
-        
+
+        # 创建并行批量处理器
+        max_workers = int(os.getenv("MAX_CONCURRENT_PROCESSING", "3"))
+        parallel_batch_processor = ParallelBatchProcessor(
+            rag_instance=rag_instance,
+            max_workers=max_workers
+        )
+
         logger.info("RAG系统初始化成功")
         logger.info(f"数据目录: {WORKING_DIR}")
         logger.info(f"输出目录: {OUTPUT_DIR}")
@@ -2042,12 +2066,19 @@ async def process_document_manually(document_id: str):
 
 @app.post("/api/v1/documents/process/batch", response_model=BatchProcessResponse)
 async def process_documents_batch(request: BatchProcessRequest):
-    """优化的批量文档处理端点 - 使用RAGAnything的高级批量处理"""
+    """优化的批量文档处理端点 - 使用真正的并行处理"""
+    # 立即添加print语句确保能看到输出
+    print(f"\n{'='*80}", flush=True)
+    print(f"[BATCH API] 批量处理端点被调用", flush=True)
+    print(f"[BATCH API] 请求数据: {request}", flush=True)
+    print(f"[BATCH API] 文档ID列表: {request.document_ids}", flush=True)
+    print(f"{'='*80}\n", flush=True)
+
     batch_operation_id = str(uuid.uuid4())
     started_count = 0
     failed_count = 0
     results = []
-    
+
     # 创建批量操作状态跟踪
     batch_operation = {
         "batch_operation_id": batch_operation_id,
@@ -2061,55 +2092,117 @@ async def process_documents_batch(request: BatchProcessRequest):
         "results": []
     }
     batch_operations[batch_operation_id] = batch_operation
-    
-    logger.info(f"🚀 开始高级批量处理 {len(request.document_ids)} 个文档")
-    await send_processing_log(f"🚀 开始高级批量处理 {len(request.document_ids)} 个文档", "info")
-    
+
+    print(f"[BATCH API] 批次ID创建: {batch_operation_id}", flush=True)
+
+    logger.info(f"="*80)
+    logger.info(f"📋 批量处理开始 - 批次ID: {batch_operation_id}")
+    logger.info(f"   文档数量: {len(request.document_ids)}")
+    logger.info(f"   文档ID列表: {request.document_ids}")
+    logger.info(f"="*80)
+    await send_processing_log(f"🚀 开始并行批量处理 {len(request.document_ids)} 个文档", "info")
+
     try:
+        print(f"[BATCH API] 进入try块", flush=True)
         # 初始化RAG系统
+        logger.info("[步骤1] 初始化RAG系统...")
+        print(f"[BATCH API] 步骤1: 开始初始化RAG系统...", flush=True)
         rag = await initialize_rag()
+        print(f"[BATCH API] RAG初始化结果: {rag is not None}", flush=True)
         if not rag:
-            raise Exception("RAG系统初始化失败")
-        
-        # 步骤1: 转换文档ID为文件路径，验证文档状态
+            error_msg = "RAG系统初始化失败 - initialize_rag()返回None"
+            logger.error(f"[步骤1失败] {error_msg}")
+            print(f"[BATCH API] 步骤1失败: {error_msg}", flush=True)
+            raise Exception(error_msg)
+        logger.info("[步骤1完成] ✅ RAG系统初始化成功")
+        print(f"[BATCH API] 步骤1完成: RAG系统初始化成功", flush=True)
+
+        # 检查是否启用并行处理
+        use_parallel = os.getenv("ENABLE_PARALLEL_PROCESSING", "true").lower() == "true"
+        max_workers = int(os.getenv("MAX_CONCURRENT_PROCESSING", "3"))
+        logger.info(f"[步骤2] 配置检查 - 并行处理: {use_parallel}, 最大工作数: {max_workers}")
+        print(f"[BATCH API] 步骤2: 配置检查 - 并行处理: {use_parallel}, 最大工作数: {max_workers}", flush=True)
+
+        # 步骤3: 转换文档ID为文件路径，验证文档状态
+        logger.info(f"[步骤3] 开始验证文档...")
+        print(f"[BATCH API] 步骤3: 开始验证 {len(request.document_ids)} 个文档", flush=True)
+        print(f"[BATCH API] 内存中文档数量: {len(documents)}", flush=True)
+
+        # 显示内存中前5个文档ID供参考
+        if documents:
+            sample_ids = list(documents.keys())[:5]
+            print(f"[BATCH API] 内存中文档ID示例: {sample_ids}", flush=True)
+
         valid_documents = []
         file_paths = []
-        
+
         for document_id in request.document_ids:
             try:
+                logger.debug(f"  检查文档 {document_id}...")
+                print(f"[BATCH API] 验证文档: {document_id}", flush=True)
                 if document_id not in documents:
+                    error_msg = f"文档不存在于内存字典中"
+                    print(f"[BATCH API] ❌ 文档不存在: {document_id}", flush=True)
+                    logger.warning(f"  ❌ 文档 {document_id}: {error_msg}")
                     results.append({
                         "document_id": document_id,
                         "file_name": "unknown",
                         "status": "failed",
-                        "message": "文档不存在",
+                        "message": error_msg,
                         "task_id": None
                     })
                     failed_count += 1
                     continue
                 
                 document = documents[document_id]
-                
-                # 检查文档状态
-                if document["status"] != "uploaded":
+                logger.debug(f"  找到文档: {document['file_name']}, 状态: {document['status']}")
+
+                # 检查文档状态 - 允许重新处理失败或卡住的文档
+                if document["status"] not in ["uploaded", "failed", "processing"]:
+                    error_msg = f"文档状态不允许处理: 当前状态={document['status']}, 需要状态=uploaded/failed/processing"
+                    logger.warning(f"  ⚠️ 文档 {document_id}: {error_msg}")
+                    print(f"[BATCH API] ⚠️ 文档状态不允许处理: {document_id}, status={document['status']}", flush=True)
                     results.append({
                         "document_id": document_id,
                         "file_name": document["file_name"],
                         "status": "failed",
-                        "message": f"文档状态不允许处理: {document['status']}",
+                        "message": error_msg,
                         "task_id": document.get("task_id")
                     })
                     failed_count += 1
                     continue
+
+                # 如果是失败或处理中状态，输出提示信息
+                if document["status"] == "failed":
+                    print(f"[BATCH API] 📝 文档将被重新处理: {document_id} ({document['file_name']})", flush=True)
+                    logger.info(f"  🔄 文档 {document_id} ({document['file_name']}) 将从失败状态重新处理")
+                elif document["status"] == "processing":
+                    print(f"[BATCH API] ⚠️ 文档卡在处理中，将强制重新处理: {document_id} ({document['file_name']})", flush=True)
+                    logger.info(f"  ⚠️ 文档 {document_id} ({document['file_name']}) 卡在处理中状态，将强制重新处理")
                 
                 # 检查任务是否存在
                 task_id = document.get("task_id")
-                if not task_id or task_id not in tasks:
+                if not task_id:
+                    error_msg = "文档没有关联的task_id"
+                    logger.warning(f"  ⚠️ 文档 {document_id}: {error_msg}")
                     results.append({
                         "document_id": document_id,
                         "file_name": document["file_name"],
                         "status": "failed",
-                        "message": "处理任务不存在",
+                        "message": error_msg,
+                        "task_id": None
+                    })
+                    failed_count += 1
+                    continue
+
+                if task_id not in tasks:
+                    error_msg = f"任务 {task_id} 不存在于tasks字典中"
+                    logger.warning(f"  ⚠️ 文档 {document_id}: {error_msg}")
+                    results.append({
+                        "document_id": document_id,
+                        "file_name": document["file_name"],
+                        "status": "failed",
+                        "message": error_msg,
                         "task_id": task_id
                     })
                     failed_count += 1
@@ -2118,24 +2211,27 @@ async def process_documents_batch(request: BatchProcessRequest):
                 # 验证文件路径存在
                 file_path = document["file_path"]
                 if not os.path.exists(file_path):
+                    error_msg = f"文件不存在: {file_path}"
+                    logger.error(f"  ❌ 文档 {document_id}: {error_msg}")
                     results.append({
                         "document_id": document_id,
                         "file_name": document["file_name"],
                         "status": "failed",
-                        "message": f"文件不存在: {file_path}",
+                        "message": error_msg,
                         "task_id": task_id
                     })
                     failed_count += 1
                     continue
                 
                 # 文档有效，添加到批处理列表
+                logger.info(f"  ✅ 文档 {document_id} ({document['file_name']}) 验证通过")
                 valid_documents.append({
                     "document_id": document_id,
                     "document": document,
                     "task_id": task_id
                 })
                 file_paths.append(file_path)
-                
+
                 # 设置初始状态
                 document["status"] = "processing"
                 document["updated_at"] = datetime.now().isoformat()
@@ -2143,139 +2239,316 @@ async def process_documents_batch(request: BatchProcessRequest):
                 tasks[task_id]["batch_operation_id"] = batch_operation_id
                 
             except Exception as e:
+                error_msg = f"准备处理时出错: {str(e)}"
+                logger.error(f"  ❌ 文档 {document_id} 验证异常: {error_msg}")
+                import traceback
+                logger.error(f"    异常堆栈:\n{traceback.format_exc()}")
                 results.append({
                     "document_id": document_id,
                     "file_name": documents.get(document_id, {}).get("file_name", "unknown"),
                     "status": "failed",
-                    "message": f"准备处理时出错: {str(e)}",
+                    "message": error_msg,
                     "task_id": None
                 })
                 failed_count += 1
-                logger.error(f"准备文档 {document_id} 失败: {str(e)}")
         
-        # 如果有有效文档，使用缓存增强的高级批量处理
+        logger.info(f"[步骤3完成] 验证结果: {len(valid_documents)}个有效, {failed_count}个失败")
+        print(f"[BATCH API] 步骤3完成: {len(valid_documents)}个有效文档, {failed_count}个失败", flush=True)
+        if valid_documents:
+            print(f"[BATCH API] 有效文档列表:", flush=True)
+            for doc_info in valid_documents:
+                print(f"[BATCH API]   - {doc_info['document_id']}: {doc_info['document']['file_name']}", flush=True)
+
+        # 初始化cache_metrics变量（并行和缓存处理都需要）
+        cache_metrics = {}
+
+        # 步骤4: 如果有有效文档，根据配置选择处理模式
         if file_paths:
-            await send_processing_log(f"📊 使用缓存增强的高级批量处理 {len(file_paths)} 个文档", "info")
-            
-            # 获取配置参数
-            max_workers = int(os.getenv("MAX_CONCURRENT_PROCESSING", "3"))
-            parse_method = request.parse_method or "auto"
-            device_type = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
-            
-            # 创建WebSocket进度回调
-            async def websocket_progress_callback(progress_data):
-                """WebSocket progress callback for real-time updates"""
+            logger.info(f"[步骤4] 开始处理 {len(file_paths)} 个有效文档...")
+            # 检查是否使用并行处理
+            if use_parallel and parallel_batch_processor:
+                logger.info(f"[步骤4.1] 使用并行处理器处理文档...")
+                await send_processing_log(f"⚡ 使用真正的并行批量处理 {len(file_paths)} 个文档 (最大并发: {max_workers})", "info")
+
+                # 检查parallel_batch_processor是否正确初始化
+                if not parallel_batch_processor:
+                    error_msg = "parallel_batch_processor未初始化"
+                    logger.error(f"[步骤4.1失败] {error_msg}")
+                    raise Exception(error_msg)
+
+                logger.info(f"  并行处理器状态: rag_instance={parallel_batch_processor.rag_instance is not None}, max_workers={parallel_batch_processor.max_workers}")
+
+                # 准备文档数据格式
+                docs_for_parallel = [
+                    {
+                        "document_id": doc_info["document_id"],
+                        "file_path": doc_info["document"]["file_path"]
+                    }
+                    for doc_info in valid_documents
+                ]
+
+                # 定义进度回调
+                async def parallel_progress_callback(progress_data):
+                    """并行处理进度回调"""
+                    try:
+                        # 发送进度到WebSocket
+                        progress_msg = {
+                            "type": "batch_progress",
+                            "batch_id": batch_operation_id,
+                            **progress_data
+                        }
+
+                        for ws in processing_log_websockets:
+                            try:
+                                await ws.send_text(json.dumps(progress_msg))
+                            except:
+                                pass
+
+                        # 记录日志
+                        if progress_data.get("status") == "completed":
+                            await send_processing_log(f"✅ 完成: {progress_data['file_name']}", "success")
+                        elif progress_data.get("status") == "failed":
+                            await send_processing_log(f"❌ 失败: {progress_data['file_name']} - {progress_data.get('error', '未知错误')}", "error")
+                        elif progress_data.get("status") == "processing":
+                            await send_processing_log(f"🔄 处理中: {progress_data['file_name']}", "info")
+                    except Exception as e:
+                        logger.error(f"进度回调错误: {e}")
+
+                # 使用并行批量处理器
                 try:
-                    # Send progress to all connected WebSocket clients
-                    for ws in processing_log_websockets:
-                        try:
-                            await ws.send_text(json.dumps(progress_data))
-                        except Exception:
-                            pass  # Remove disconnected clients silently
+                    logger.info(f"  调用 process_batch_parallel，参数:")
+                    logger.info(f"    - documents数量: {len(docs_for_parallel)}")
+                    logger.info(f"    - output_dir: {OUTPUT_DIR}")
+                    logger.info(f"    - parse_method: {request.parse_method or 'auto'}")
+                    logger.info(f"    - device: {'cuda' if TORCH_AVAILABLE and torch.cuda.is_available() else 'cpu'}")
+
+                    batch_result = await parallel_batch_processor.process_batch_parallel(
+                        documents=docs_for_parallel,
+                        progress_callback=parallel_progress_callback,
+                        output_dir=OUTPUT_DIR,
+                        parse_method=request.parse_method or "auto",
+                        device="cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu",
+                        lang="en"
+                    )
+
+                    logger.info(f"[步骤4.1完成] 并行处理返回结果:")
+                    logger.info(f"  - 成功: {batch_result.get('successful', 0)}")
+                    logger.info(f"  - 失败: {batch_result.get('failed', 0)}")
+                    logger.info(f"  - 总耗时: {batch_result.get('total_time', 0):.1f}秒")
+
                 except Exception as e:
-                    logger.debug(f"WebSocket progress callback error: {e}")
-            
-            # Register progress callback with advanced progress tracker
-            advanced_progress_tracker.register_websocket_callback(websocket_progress_callback)
-            
-            try:
-                # 使用缓存增强处理器进行批量处理，带有增强的错误处理和进度跟踪
-                batch_result = await cache_enhanced_processor.batch_process_with_cache_tracking(
-                    file_paths=file_paths,
-                    progress_callback=websocket_progress_callback,
-                    output_dir=OUTPUT_DIR,
-                    parse_method=parse_method,
-                    max_workers=max_workers,
-                    recursive=False,  # 不扫描目录，处理明确的文件列表
-                    show_progress=True,
-                    lang="en",  # 可以从配置中获取
-                    device=device_type if TORCH_AVAILABLE else "cpu"
+                    error_msg = f"并行处理器执行失败: {str(e)}"
+                    logger.error(f"[步骤4.1失败] {error_msg}")
+                    import traceback
+                    logger.error(f"异常堆栈:\n{traceback.format_exc()}")
+                    raise Exception(error_msg)
+
+                # 处理结果
+                for doc_info in valid_documents:
+                    document_id = doc_info["document_id"]
+                    document = doc_info["document"]
+                    task_id = doc_info["task_id"]
+
+                    doc_result = batch_result["results"].get(document_id, {})
+
+                    if doc_result.get("success"):
+                        # 成功处理
+                        document["status"] = "completed"
+                        tasks[task_id]["status"] = "completed"
+                        tasks[task_id]["completed_at"] = datetime.now().isoformat()
+
+                        await safe_update_document_status(
+                            document_id,
+                            "completed",
+                            processing_time=doc_result.get("processing_time"),
+                            parser_used=doc_result.get("parser_used")
+                        )
+
+                        results.append({
+                            "document_id": document_id,
+                            "file_name": document["file_name"],
+                            "status": "success",
+                            "message": f"并行处理成功 (耗时: {doc_result.get('processing_time', 0):.1f}秒)",
+                            "task_id": task_id
+                        })
+                        started_count += 1
+                    else:
+                        # 处理失败
+                        error_msg = doc_result.get("error", "并行处理失败")
+                        document["status"] = "failed"
+                        tasks[task_id]["status"] = "failed"
+                        tasks[task_id]["error"] = error_msg
+
+                        await safe_update_document_status(
+                            document_id,
+                            "failed",
+                            error_message=error_msg
+                        )
+
+                        results.append({
+                            "document_id": document_id,
+                            "file_name": document["file_name"],
+                            "status": "failed",
+                            "message": f"处理失败: {error_msg}",
+                            "task_id": task_id
+                        })
+                        failed_count += 1
+
+                # 记录性能统计
+                await send_processing_log(
+                    f"📊 并行批量处理完成: {batch_result['successful']}/{batch_result['total_documents']} 成功, "
+                    f"总耗时 {batch_result['total_time']:.1f}秒, "
+                    f"并行加速比 {batch_result['parallel_speedup']:.2f}x",
+                    "info"
                 )
-            finally:
-                # Clean up progress callback registration
+            else:
+                # 使用原有的缓存增强处理器（保持向后兼容）
+                logger.info(f"[步骤4.2] 使用缓存增强处理器处理文档...")
+                await send_processing_log(f"📊 使用缓存增强的高级批量处理 {len(file_paths)} 个文档", "info")
+
+                if not cache_enhanced_processor:
+                    error_msg = "cache_enhanced_processor未初始化"
+                    logger.error(f"[步骤4.2失败] {error_msg}")
+                    raise Exception(error_msg)
+
+                # 获取配置参数
+                parse_method = request.parse_method or "auto"
+                device_type = "cuda" if TORCH_AVAILABLE and torch.cuda.is_available() else "cpu"
+
+                # 创建WebSocket进度回调
+                async def websocket_progress_callback(progress_data):
+                    """WebSocket progress callback for real-time updates"""
+                    try:
+                        # Send progress to all connected WebSocket clients
+                        for ws in processing_log_websockets:
+                            try:
+                                await ws.send_text(json.dumps(progress_data))
+                            except Exception:
+                                pass  # Remove disconnected clients silently
+                    except Exception as e:
+                        logger.debug(f"WebSocket progress callback error: {e}")
+
+                # Register progress callback with advanced progress tracker
+                advanced_progress_tracker.register_websocket_callback(websocket_progress_callback)
+
                 try:
-                    advanced_progress_tracker.unregister_websocket_callback(websocket_progress_callback)
-                except Exception:
-                    pass
-            
-            await send_processing_log(f"✅ RAGAnything批量处理完成", "info")
-            
-            # 步骤3: 处理批量结果并更新文档状态
-            parse_results = batch_result.get("parse_result", {})
-            # 获取成功和失败的文件列表
-            successful_files = batch_result.get("successful_files", [])
-            failed_files = batch_result.get("failed_files", [])
-            errors = batch_result.get("errors", {})
-            successful_rag_files = batch_result.get("successful_rag_files", 0)
-            processing_time = batch_result.get("total_processing_time", 0)
-            cache_metrics = batch_result.get("cache_metrics", {})
-            
-            # 映射文件路径到文档ID
-            path_to_doc = {doc_info["document"]["file_path"]: doc_info for doc_info in valid_documents}
-            
-            # 处理每个文件的结果
-            for file_path in file_paths:
-                doc_info = path_to_doc[file_path]
-                document_id = doc_info["document_id"]
-                document = doc_info["document"]
-                task_id = doc_info["task_id"]
-                
-                # 检查文件是否在成功列表中
-                if file_path in successful_files:
-                    # 成功处理
-                    document["status"] = "completed"
-                    tasks[task_id]["status"] = "completed"
-                    tasks[task_id]["completed_at"] = datetime.now().isoformat()
+                    logger.info(f"  调用 batch_process_with_cache_tracking，参数:")
+                    logger.info(f"    - file_paths数量: {len(file_paths)}")
+                    logger.info(f"    - output_dir: {OUTPUT_DIR}")
+                    logger.info(f"    - parse_method: {parse_method}")
+                    logger.info(f"    - max_workers: {max_workers}")
 
-                    # Update database status through state manager
-                    await safe_update_document_status(
-                        document_id,
-                        "completed"
+                    # 使用缓存增强处理器进行批量处理，带有增强的错误处理和进度跟踪
+                    batch_result = await cache_enhanced_processor.batch_process_with_cache_tracking(
+                        file_paths=file_paths,
+                        progress_callback=websocket_progress_callback,
+                        output_dir=OUTPUT_DIR,
+                        parse_method=parse_method,
+                        max_workers=max_workers,
+                        recursive=False,  # 不扫描目录，处理明确的文件列表
+                        show_progress=True,
+                        lang="en",  # 可以从配置中获取
+                        device=device_type if TORCH_AVAILABLE else "cpu"
                     )
 
-                    results.append({
-                        "document_id": document_id,
-                        "file_name": document["file_name"],
-                        "status": "success",
-                        "message": "文档批量处理成功",
-                        "task_id": task_id
-                    })
-                    started_count += 1
-                else:
-                    # 处理失败 - 从errors字典获取错误信息
-                    error_msg = errors.get(file_path, "批量处理过程中出现未知错误")
-                    document["status"] = "failed"
-                    tasks[task_id]["status"] = "failed"
-                    tasks[task_id]["error"] = error_msg
-                    tasks[task_id]["updated_at"] = datetime.now().isoformat()
+                    logger.info(f"[步骤4.2完成] 缓存处理返回结果:")
+                    logger.info(f"  - successful_files: {len(batch_result.get('successful_files', []))}")
+                    logger.info(f"  - failed_files: {len(batch_result.get('failed_files', []))}")
+                    logger.info(f"  - total_processing_time: {batch_result.get('total_processing_time', 0):.1f}秒")
 
-                    # Update database status through state manager
-                    await safe_update_document_status(
-                        document_id,
-                        "failed",
-                        error_message=error_msg
-                    )
+                except Exception as e:
+                    error_msg = f"缓存处理器执行失败: {str(e)}"
+                    logger.error(f"[步骤4.2失败] {error_msg}")
+                    import traceback
+                    logger.error(f"异常堆栈:\n{traceback.format_exc()}")
+                    raise Exception(error_msg)
 
-                    results.append({
-                        "document_id": document_id,
-                        "file_name": document["file_name"],
-                        "status": "failed",
-                        "message": f"RAG处理失败: {error_msg}",
-                        "task_id": task_id
-                    })
-                    failed_count += 1
-            
-            # 记录详细的缓存性能统计
-            cache_hits = cache_metrics.get("cache_hits", 0)
-            cache_misses = cache_metrics.get("cache_misses", 0)
-            time_saved = cache_metrics.get("total_time_saved", 0.0)
-            hit_ratio = cache_metrics.get("cache_hit_ratio", 0.0)
-            efficiency = cache_metrics.get("efficiency_improvement", 0.0)
-            
-            await send_processing_log(f"📈 批量处理性能统计: {successful_rag_files} 成功, 耗时 {processing_time:.2f}s", "info")
-            await send_processing_log(f"🚀 缓存性能: {cache_hits} 命中, {cache_misses} 未命中, 命中率 {hit_ratio:.1f}%", "info")
-            if time_saved > 0:
-                await send_processing_log(f"⚡ 时间节省: {time_saved:.1f}s, 效率提升 {efficiency:.1f}%", "info")
+                finally:
+                    # Clean up progress callback registration
+                    try:
+                        advanced_progress_tracker.unregister_websocket_callback(websocket_progress_callback)
+                    except Exception:
+                        pass
+
+                await send_processing_log(f"✅ RAGAnything批量处理完成", "info")
+
+                # 步骤3: 处理批量结果并更新文档状态
+                parse_results = batch_result.get("parse_result", {})
+                # 获取成功和失败的文件列表
+                successful_files = batch_result.get("successful_files", [])
+                failed_files = batch_result.get("failed_files", [])
+                errors = batch_result.get("errors", {})
+                successful_rag_files = batch_result.get("successful_rag_files", 0)
+                processing_time = batch_result.get("total_processing_time", 0)
+                cache_metrics = batch_result.get("cache_metrics", {})
+
+                # 映射文件路径到文档ID
+                path_to_doc = {doc_info["document"]["file_path"]: doc_info for doc_info in valid_documents}
+
+                # 处理每个文件的结果
+                for file_path in file_paths:
+                    doc_info = path_to_doc[file_path]
+                    document_id = doc_info["document_id"]
+                    document = doc_info["document"]
+                    task_id = doc_info["task_id"]
+
+                    # 检查文件是否在成功列表中
+                    if file_path in successful_files:
+                        # 成功处理
+                        document["status"] = "completed"
+                        tasks[task_id]["status"] = "completed"
+                        tasks[task_id]["completed_at"] = datetime.now().isoformat()
+
+                        # Update database status through state manager
+                        await safe_update_document_status(
+                            document_id,
+                            "completed"
+                        )
+
+                        results.append({
+                            "document_id": document_id,
+                            "file_name": document["file_name"],
+                            "status": "success",
+                            "message": "文档批量处理成功",
+                            "task_id": task_id
+                        })
+                        started_count += 1
+                    else:
+                        # 处理失败 - 从errors字典获取错误信息
+                        error_msg = errors.get(file_path, "批量处理过程中出现未知错误")
+                        document["status"] = "failed"
+                        tasks[task_id]["status"] = "failed"
+                        tasks[task_id]["error"] = error_msg
+                        tasks[task_id]["updated_at"] = datetime.now().isoformat()
+
+                        # Update database status through state manager
+                        await safe_update_document_status(
+                            document_id,
+                            "failed",
+                            error_message=error_msg
+                        )
+
+                        results.append({
+                            "document_id": document_id,
+                            "file_name": document["file_name"],
+                            "status": "failed",
+                            "message": f"RAG处理失败: {error_msg}",
+                            "task_id": task_id
+                        })
+                        failed_count += 1
+
+                # 记录详细的缓存性能统计
+                cache_metrics = batch_result.get("cache_metrics", {})
+                cache_hits = cache_metrics.get("cache_hits", 0)
+                cache_misses = cache_metrics.get("cache_misses", 0)
+                time_saved = cache_metrics.get("total_time_saved", 0.0)
+                hit_ratio = cache_metrics.get("cache_hit_ratio", 0.0)
+                efficiency = cache_metrics.get("efficiency_improvement", 0.0)
+
+                await send_processing_log(f"📈 批量处理性能统计: {successful_rag_files} 成功, 耗时 {processing_time:.2f}s", "info")
+                await send_processing_log(f"🚀 缓存性能: {cache_hits} 命中, {cache_misses} 未命中, 命中率 {hit_ratio:.1f}%", "info")
+                if time_saved > 0:
+                    await send_processing_log(f"⚡ 时间节省: {time_saved:.1f}s, 效率提升 {efficiency:.1f}%", "info")
         
         # 更新批量操作状态
         batch_operation["completed_items"] = started_count
@@ -2306,10 +2579,27 @@ async def process_documents_batch(request: BatchProcessRequest):
                 "efficiency_improvement": 0.0
             }
         }
-        
+
         return BatchProcessResponse(**response_data)
-        
+
     except Exception as e:
+        # 立即打印异常信息
+        print(f"\n[BATCH API ERROR] ❌ 批量处理失败!!!", flush=True)
+        print(f"[BATCH API ERROR] 批次ID: {batch_operation_id}", flush=True)
+        print(f"[BATCH API ERROR] 异常类型: {type(e).__name__}", flush=True)
+        print(f"[BATCH API ERROR] 异常消息: {str(e)}", flush=True)
+        import traceback
+        error_traceback = traceback.format_exc()
+        print(f"[BATCH API ERROR] 完整堆栈:\n{error_traceback}", flush=True)
+
+        # 记录主异常
+        logger.error(f"="*80)
+        logger.error(f"[批量处理失败] 批次ID: {batch_operation_id}")
+        logger.error(f"异常类型: {type(e).__name__}")
+        logger.error(f"异常消息: {str(e)}")
+        logger.error(f"完整堆栈跟踪:\n{error_traceback}")
+        logger.error(f"="*80)
+
         # 使用增强的错误处理器
         error_info = enhanced_error_handler.categorize_error(e, {
             "operation": "batch_processing",
